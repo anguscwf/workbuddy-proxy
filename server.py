@@ -82,6 +82,30 @@ def _detect_wb_version() -> str:
                 return v
         except Exception:
             continue
+
+    # WorkBuddy 5.x packages product metadata inside app.asar.
+    asar_candidates = [
+        Path(os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\resources\app.asar")),
+        Path("/Applications/WorkBuddy.app/Contents/Resources/app.asar"),
+    ]
+    for asar_path in asar_candidates:
+        try:
+            import struct
+
+            with asar_path.open("rb") as archive:
+                prefix = archive.read(16)
+                header_size = struct.unpack_from("<I", prefix, 4)[0]
+                header_json_size = struct.unpack_from("<I", prefix, 12)[0]
+                header = json.loads(archive.read(header_json_size))
+                package_meta = header["files"]["package.json"]
+                archive.seek(8 + header_size + int(package_meta["offset"]))
+                package = json.loads(archive.read(package_meta["size"]))
+            version = package.get("version", "")
+            if version:
+                log.info(f"Detected WorkBuddy {version} from {asar_path}")
+                return version
+        except Exception:
+            continue
     return ""
 
 
@@ -279,10 +303,24 @@ class TokenManager:
                         "expression": """
                             (async () => {
                                 try {
-                                    const s = await window.vscode.ipcRenderer.invoke(
-                                        'vscode:genie:auth:getSession'
-                                    );
-                                    return JSON.stringify(s);
+                                    const providers = window.__GENIE_DEFAULT_APP_PROVIDERS__;
+                                    if (providers?.auth?.getToken) {
+                                        const token = await providers.auth.getToken();
+                                        return JSON.stringify({
+                                            accessToken: typeof token === 'string'
+                                                ? token
+                                                : (token?.accessToken || token?.token || ''),
+                                            refreshToken: typeof token === 'object'
+                                                ? (token?.refreshToken || '')
+                                                : ''
+                                        });
+                                    }
+                                    if (window.vscode?.ipcRenderer?.invoke) {
+                                        return JSON.stringify(await window.vscode.ipcRenderer.invoke(
+                                            'vscode:genie:auth:getSession'
+                                        ));
+                                    }
+                                    throw new Error('No supported WorkBuddy auth API found');
                                 } catch(e) {
                                     return JSON.stringify({error: e.message});
                                 }
@@ -327,6 +365,9 @@ token_mgr = TokenManager()
 # This map translates Cursor names → WorkBuddy model IDs.
 # ---------------------------------------------------------------------------
 CURSOR_TO_WB_MAP: dict[str, str] = {
+    # DeepSeek aliases used by existing NGL presets
+    "deepseek-v4-flash": "deepseek-v4-flash-ioa",
+    "deepseek-v4-pro": "deepseek-v4-pro-ioa",
     # Claude
     "claude-4.6-opus-high": "claude-opus-4.6",
     "claude-4.6-opus-max": "claude-opus-4.6-1m",
@@ -375,6 +416,8 @@ def resolve_model(model: str) -> str:
 # ---------------------------------------------------------------------------
 MODELS = [
     # DeepSeek
+    {"id": "deepseek-v4-flash-ioa", "name": "DeepSeek-V4-Flash"},
+    {"id": "deepseek-v4-pro-ioa", "name": "DeepSeek-V4-Pro"},
     {"id": "deepseek-r1", "name": "DeepSeek-R1"},
     {"id": "deepseek-v3", "name": "DeepSeek-V3"},
     {"id": "deepseek-v3.2", "name": "DeepSeek-V3.2"},
@@ -442,9 +485,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,  # 与 allow_origins=["*"] 不能同时为 True
+    allow_private_network=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 def _verify_api_key(request: Request):

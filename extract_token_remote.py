@@ -89,10 +89,24 @@ async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | N
                 "expression": """
                     (async () => {
                         try {
-                            const s = await window.vscode.ipcRenderer.invoke(
-                                'vscode:genie:auth:getSession'
-                            );
-                            return JSON.stringify(s);
+                            const providers = window.__GENIE_DEFAULT_APP_PROVIDERS__;
+                            if (providers?.auth?.getToken) {
+                                const token = await providers.auth.getToken();
+                                return JSON.stringify({
+                                    accessToken: typeof token === 'string'
+                                        ? token
+                                        : (token?.accessToken || token?.token || ''),
+                                    refreshToken: typeof token === 'object'
+                                        ? (token?.refreshToken || '')
+                                        : ''
+                                });
+                            }
+                            if (window.vscode?.ipcRenderer?.invoke) {
+                                return JSON.stringify(await window.vscode.ipcRenderer.invoke(
+                                    'vscode:genie:auth:getSession'
+                                ));
+                            }
+                            throw new Error('No supported WorkBuddy auth API found');
                         } catch(e) {
                             return JSON.stringify({error: e.message});
                         }
@@ -178,8 +192,8 @@ def main():
         sys.exit(1)
 
     print(f"\n✅ Token 提取成功！")
-    print(f"   accessToken:  {access_token[:40]}... (len={len(access_token)})")
-    print(f"   refreshToken: {refresh_token[:40] if refresh_token else 'N/A'}... "
+    print(f"   accessToken:  extracted (len={len(access_token)})")
+    print(f"   refreshToken: extracted={bool(refresh_token)} "
           f"(len={len(refresh_token) if refresh_token else 0})")
 
     if args.save or args.output:

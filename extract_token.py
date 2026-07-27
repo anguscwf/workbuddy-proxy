@@ -62,10 +62,24 @@ async def extract(cdp_port: int = 9222) -> dict | None:
                 "expression": """
                     (async () => {
                         try {
-                            const s = await window.vscode.ipcRenderer.invoke(
-                                'vscode:genie:auth:getSession'
-                            );
-                            return JSON.stringify(s);
+                            const providers = window.__GENIE_DEFAULT_APP_PROVIDERS__;
+                            if (providers?.auth?.getToken) {
+                                const token = await providers.auth.getToken();
+                                return JSON.stringify({
+                                    accessToken: typeof token === 'string'
+                                        ? token
+                                        : (token?.accessToken || token?.token || ''),
+                                    refreshToken: typeof token === 'object'
+                                        ? (token?.refreshToken || '')
+                                        : ''
+                                });
+                            }
+                            if (window.vscode?.ipcRenderer?.invoke) {
+                                return JSON.stringify(await window.vscode.ipcRenderer.invoke(
+                                    'vscode:genie:auth:getSession'
+                                ));
+                            }
+                            throw new Error('No supported WorkBuddy auth API found');
                         } catch(e) {
                             return JSON.stringify({error: e.message});
                         }
@@ -110,8 +124,8 @@ def main():
         print("未获取到 accessToken")
         sys.exit(1)
 
-    print(f"accessToken:  {access_token[:40]}...  (len={len(access_token)})")
-    print(f"refreshToken: {refresh_token[:40]}...  (len={len(refresh_token)})")
+    print(f"accessToken:  extracted (len={len(access_token)})")
+    print(f"refreshToken: extracted={bool(refresh_token)} (len={len(refresh_token)})")
 
     if args.save:
         import time
