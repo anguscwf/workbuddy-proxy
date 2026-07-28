@@ -453,9 +453,40 @@ MODELS = [
     {"id": "hunyuan-2.0-thinking-ioa", "name": "Hunyuan-2.0-Thinking"},
     # Kimi
     {"id": "kimi-k2.5-ioa", "name": "Kimi-K2.5"},
+    {"id": "kimi-k3-ioa", "name": "Kimi-K3"},
     # Default
     {"id": "codewise-default-model-v2", "name": "Default (Codewise)"},
 ]
+
+MODEL_IDS = frozenset(model["id"] for model in MODELS)
+ADVERTISED_MODEL_IDS = MODEL_IDS.union(CURSOR_TO_WB_MAP)
+
+
+def resolve_allowed_model(raw_model: object) -> str:
+    if not isinstance(raw_model, str):
+        raise ValueError("model must be a string returned by /v1/models")
+    requested = raw_model
+    if requested != requested.strip() or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", requested):
+        raise ValueError("model has an invalid format")
+    if requested not in ADVERTISED_MODEL_IDS:
+        raise ValueError(f"Model '{requested}' is not advertised by /v1/models")
+    resolved = resolve_model(requested)
+    if resolved not in MODEL_IDS:
+        raise ValueError(f"Model '{requested}' has no advertised WorkBuddy target")
+    return resolved
+
+
+def model_error(message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "AI_MODEL_NOT_AVAILABLE",
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +608,10 @@ async def chat_completions(request: Request):
 
     body = await request.json()
     raw_model = body.get("model", "deepseek-v3")
-    model = resolve_model(raw_model)  # Cursor name → WB model ID
+    try:
+        model = resolve_allowed_model(raw_model)
+    except ValueError as exc:
+        return model_error(str(exc))
     stream = body.get("stream", False)
 
     if raw_model != model:
