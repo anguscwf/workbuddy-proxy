@@ -1,8 +1,8 @@
 # NGL sidecar watchdog
 
-`ngl-sidecar-watchdog.ps1` is a single-pass, idempotent recovery guard for the
-company-PC sidecars. Task Scheduler controls how often it runs; the script has
-no polling loop and reserves a 55-second run budget.
+`ngl_sidecar_watchdog.py` is the production, single-pass, idempotent recovery
+guard for the company-PC sidecars. Task Scheduler controls how often it runs;
+the script has no polling loop and reserves a 55-second run budget.
 
 Each pass:
 
@@ -22,12 +22,18 @@ prevent proxy or tunnel recovery. The log defaults to
 with only one prior generation retained. Log events contain fixed state names
 and exception types, never tokens, request bodies, headers, or exception text.
 
-`-DryRun` keeps all process/task starts disabled and is intended for local
-validation. The production scheduled task should use `IgnoreNew`, run once per
-minute, and invoke Windows PowerShell with:
+`--dry-run` keeps all task starts disabled and is intended for local
+validation. The production scheduled task uses `IgnoreNew`, runs once per
+minute, and directly invokes the project virtual environment's windowless
+interpreter:
 
 ```text
--NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<path>\scripts\ngl-sidecar-watchdog.ps1"
+<path>\.venv\Scripts\pythonw.exe "<path>\scripts\ngl_sidecar_watchdog.py"
 ```
 
-The scheduled-task registration is intentionally not performed by this script.
+The Python watchdog never launches PowerShell or `cmd.exe`. Its `tasklist.exe`
+and `schtasks.exe` helpers are always created with `CREATE_NO_WINDOW` and
+`SW_HIDE`, so those helper calls cannot create a visible console window. The former PowerShell implementation is
+retained only as a rollback reference and is no longer the production entry
+point. Scheduled-task registration is intentionally not performed by the
+script.
