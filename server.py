@@ -13,14 +13,16 @@ Usage:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -125,6 +127,41 @@ HEADERS_TEMPLATE = {
 REASONING_MODELS = {"deepseek-r1", "deepseek-r1-0528-lkeap", "hunyuan-2.0-thinking-ioa"}
 DEFAULT_TIMEOUT = int(os.getenv("WB_TIMEOUT", "120"))
 REASONING_TIMEOUT = int(os.getenv("WB_REASONING_TIMEOUT", "300"))
+RECOVERY_INTERVAL = max(1, int(os.getenv("WB_RECOVERY_INTERVAL", "10")))
+
+
+def _workbuddy_running() -> bool:
+    """Return whether the local WorkBuddy desktop process is running."""
+    try:
+        if sys.platform == "win32":
+            completed = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq WorkBuddy.exe", "/NH", "/FO", "CSV"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return completed.returncode == 0 and '"workbuddy.exe"' in completed.stdout.lower()
+        completed = subprocess.run(
+            ["pgrep", "-f", "WorkBuddy"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return False
+
+
+def _local_websocket_options(connect_callable) -> dict:
+    """Disable environment proxies when the installed websockets API supports it."""
+    try:
+        if "proxy" in inspect.signature(connect_callable).parameters:
+            return {"proxy": None}
+    except (TypeError, ValueError):
+        pass
+    return {}
 
 
 def _parse_jwt_claims(token: str) -> dict:
@@ -154,6 +191,8 @@ def _parse_jwt_claims(token: str) -> dict:
 # Token management
 # ---------------------------------------------------------------------------
 class TokenManager:
+    """Owns token state without making service availability depend on WorkBuddy."""
+
     def __init__(self):
         self.access_token: str = ""
         self.refresh_token: str = ""
@@ -161,81 +200,169 @@ class TokenManager:
         self.enterprise_id: str = ""
         self.domain: str = ""
         self.department_info: str = ""
+        self.state: str = "initializing"
+        self.last_error: str | None = None
+        self.last_recovery_at: float | None = None
+        self.next_retry_at: float = 0.0
+        self.wb_online: bool = _workbuddy_running()
         self._lock = asyncio.Lock()
 
     async def init(self):
+        """Load local state only; network recovery runs after FastAPI starts."""
+        self.state = "initializing"
+        self.wb_online = _workbuddy_running()
         self.access_token = os.getenv("WB_TOKEN", "")
         self.refresh_token = os.getenv("WB_REFRESH_TOKEN", "")
 
         if not self.access_token:
             self._load_from_file()
 
-        if not self.access_token:
-            await self._extract_from_cdp()
-
         if self.access_token:
             self._apply_claims()
+
+        if self.has_valid_token:
+            self._set_ready()
             self._log_token_info()
             self._save_to_file()
+        else:
+            if self.access_token:
+                log.warning("Cached WorkBuddy token is expired or malformed; it will not be forwarded")
+            self._set_waiting("token_unavailable")
+
+    @property
+    def has_valid_token(self) -> bool:
+        return self._is_token_valid(self.access_token)
+
+    @property
+    def retrying(self) -> bool:
+        return not self.has_valid_token
+
+    def _set_ready(self):
+        self.state = "ready" if self.wb_online else "ready_cached_token"
+        self.last_error = None
+
+    def _set_waiting(self, reason: str):
+        self.state = "waiting_for_token" if self.wb_online else "waiting_for_workbuddy"
+        self.last_error = reason
 
     def _apply_claims(self):
         claims = _parse_jwt_claims(self.access_token)
         self.user_id = os.getenv("WB_USER_ID", "") or claims["user_id"]
         self.enterprise_id = os.getenv("WB_ENTERPRISE_ID", "") or claims["enterprise_id"]
         self.domain = os.getenv("WB_DOMAIN", "") or claims["domain"]
-        log.info(f"User: {self.user_id[:8]}..., Enterprise: {self.enterprise_id}, Domain: {self.domain}")
+        log.info("WorkBuddy token claims loaded")
 
     def _load_from_file(self):
-        if TOKEN_FILE.exists():
-            try:
-                data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-                self.access_token = data.get("access_token", "")
-                self.refresh_token = data.get("refresh_token", "")
-                if self.access_token:
-                    log.info("Token loaded from file")
-            except Exception:
-                pass
+        if not TOKEN_FILE.exists():
+            return
+        try:
+            data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+            access_token = data.get("access_token", "")
+            refresh_token = data.get("refresh_token", "")
+            self.access_token = access_token if isinstance(access_token, str) else ""
+            self.refresh_token = refresh_token if isinstance(refresh_token, str) else ""
+            if self.access_token:
+                log.info("Token loaded from file")
+        except (OSError, ValueError, TypeError):
+            self.last_error = "token_file_unreadable"
+            log.warning("Token file is unreadable; waiting for WorkBuddy recovery")
 
     def _save_to_file(self):
-        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_FILE.write_text(json.dumps({
-            "access_token": self.access_token,
-            "refresh_token": self.refresh_token,
-            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }, indent=2), encoding="utf-8")
+        if not self.has_valid_token:
+            return
+        try:
+            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            temporary = TOKEN_FILE.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, indent=2), encoding="utf-8")
+            os.replace(temporary, TOKEN_FILE)
+        except OSError:
+            self.last_error = "token_file_write_failed"
+            log.warning("Could not persist refreshed token")
 
     async def get_token(self) -> str:
-        if self._is_expired():
-            await self.refresh()
-        return self.access_token
-
-    def _is_expired(self) -> bool:
-        if not self.access_token:
-            return True
+        if self.has_valid_token:
+            return self.access_token
+        if time.monotonic() < self.next_retry_at:
+            return ""
         try:
-            payload = jwt.decode(self.access_token, options={"verify_signature": False})
-            return time.time() > (payload.get("exp", 0) - 300)
+            await self.refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._set_waiting(f"token_recovery_{type(exc).__name__}")
+            log.warning("Token recovery failed (%s); request will be rejected with 503", type(exc).__name__)
+        return self.access_token if self.has_valid_token else ""
+
+    @staticmethod
+    def _is_token_valid(token: str) -> bool:
+        if not isinstance(token, str) or not token:
+            return False
+        try:
+            payload = jwt.decode(token, options={"verify_signature": False})
+            exp = payload.get("exp")
+            return (
+                isinstance(exp, (int, float))
+                and not isinstance(exp, bool)
+                and exp > time.time() + 300
+            )
         except Exception:
             return False
+
+    def _is_expired(self) -> bool:
+        return not self.has_valid_token
 
     def _log_token_info(self):
         try:
             payload = jwt.decode(self.access_token, options={"verify_signature": False})
             hours = (payload.get("exp", 0) - time.time()) / 3600
-            log.info(f"Token valid, expires in {hours:.1f}h")
+            log.info("Token valid, expires in %.1fh", hours)
         except Exception:
-            log.warning("Could not decode token")
+            log.warning("Could not decode token expiry")
 
-    async def refresh(self):
+    async def refresh(self, force: bool = False) -> bool:
+        """Refresh safely. Exceptions are converted into degraded state."""
         async with self._lock:
-            if not self._is_expired():
-                return
-            if self.refresh_token:
-                await self._refresh_via_api()
-            else:
-                await self._extract_from_cdp()
+            if not force and self.has_valid_token:
+                self._set_ready()
+                return True
+            if not force and time.monotonic() < self.next_retry_at:
+                return False
 
-    async def _refresh_via_api(self):
+            self.wb_online = _workbuddy_running()
+            rejected_token = self.access_token if force else ""
+            refreshed = False
+            try:
+                if self.refresh_token:
+                    refreshed = await self._refresh_via_api()
+                if not refreshed and self.wb_online:
+                    refreshed = await self._extract_from_cdp()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = f"token_recovery_{type(exc).__name__}"
+                log.warning("Token refresh failed (%s); retry remains active", type(exc).__name__)
+
+            if force and refreshed and self.access_token == rejected_token:
+                refreshed = False
+                self.last_error = "refresh_reused_rejected_token"
+            if refreshed and self.has_valid_token:
+                self.next_retry_at = 0.0
+                self._set_ready()
+                return True
+
+            self.next_retry_at = time.monotonic() + RECOVERY_INTERVAL
+            if force:
+                # A 401 proves the current access token is unusable even when its
+                # JWT expiry is in the future. Never send that token a second time.
+                self.access_token = ""
+            self._set_waiting(self.last_error or "token_refresh_failed")
+            return False
+
+    async def _refresh_via_api(self) -> bool:
         log.info("Refreshing token via API...")
         headers = {
             **HEADERS_TEMPLATE,
@@ -252,50 +379,76 @@ class TokenManager:
         }
         if self.department_info:
             headers["X-Department-Info"] = self.department_info
-        async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(
-                f"{WB_API_BASE}/v2/plugin/auth/token/refresh",
-                headers=headers,
-                json={},
-                timeout=15,
-            )
-            data = resp.json()
-            if data.get("code") == 0 and data.get("data", {}).get("accessToken"):
-                self.access_token = data["data"]["accessToken"]
-                if data["data"].get("refreshToken"):
-                    self.refresh_token = data["data"]["refreshToken"]
-                self._apply_claims()
-                log.info("Token refreshed successfully via API")
-                self._log_token_info()
-                self._save_to_file()
-            else:
-                log.error(f"Token refresh failed: {data}")
-                await self._extract_from_cdp()
-
-    async def _extract_from_cdp(self):
-        log.info(f"Extracting token from WorkBuddy via CDP ({CDP_URL})...")
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(verify=False) as client:
+                resp = await client.post(
+                    f"{WB_API_BASE}/v2/plugin/auth/token/refresh",
+                    headers=headers,
+                    json={},
+                    timeout=15,
+                )
+            if resp.status_code != 200:
+                self.last_error = f"refresh_http_{resp.status_code}"
+                log.warning("Token refresh returned HTTP %s", resp.status_code)
+                return False
+            data = resp.json()
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
+            self.last_error = f"refresh_{type(exc).__name__}"
+            log.warning("Token refresh endpoint unavailable (%s)", type(exc).__name__)
+            return False
+
+        candidate = data.get("data", {}).get("accessToken") if isinstance(data, dict) else ""
+        if not self._is_token_valid(candidate):
+            self.last_error = "refresh_invalid_token"
+            log.warning("Token refresh did not return a valid token")
+            return False
+
+        self.access_token = candidate
+        candidate_refresh = data.get("data", {}).get("refreshToken", "")
+        if isinstance(candidate_refresh, str) and candidate_refresh:
+            self.refresh_token = candidate_refresh
+        self._apply_claims()
+        self._log_token_info()
+        self._save_to_file()
+        log.info("Token refreshed successfully via API")
+        return True
+
+    async def _extract_from_cdp(self) -> bool:
+        if not self.wb_online:
+            self.last_error = "workbuddy_offline"
+            return False
+
+        log.info("Extracting token from WorkBuddy via local CDP...")
+        try:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 resp = await client.get(f"{CDP_URL}/json", timeout=5)
+                resp.raise_for_status()
                 targets = resp.json()
+            if not isinstance(targets, list):
+                self.last_error = "cdp_invalid_response"
+                return False
 
             ws_url = None
-            for t in targets:
-                if t.get("type") == "page" and "workbench" in t.get("url", ""):
-                    ws_url = t.get("webSocketDebuggerUrl")
+            for target in targets:
+                if target.get("type") == "page" and "workbench" in target.get("url", ""):
+                    ws_url = target.get("webSocketDebuggerUrl")
                     break
             if not ws_url:
-                for t in targets:
-                    if t.get("type") == "page":
-                        ws_url = t.get("webSocketDebuggerUrl")
+                for target in targets:
+                    if target.get("type") == "page":
+                        ws_url = target.get("webSocketDebuggerUrl")
                         break
             if not ws_url:
-                log.error("No CDP target found")
-                return
+                self.last_error = "cdp_target_missing"
+                log.warning("No WorkBuddy CDP target found; retry remains active")
+                return False
 
             import websockets
 
-            async with websockets.connect(ws_url) as ws:
+            connect_options = _local_websocket_options(websockets.connect)
+            async with websockets.connect(ws_url, **connect_options) as ws:
                 cmd = {
                     "id": 1,
                     "method": "Runtime.evaluate",
@@ -333,28 +486,70 @@ class TokenManager:
                 await ws.send(json.dumps(cmd))
                 result = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
 
-                value = result.get("result", {}).get("result", {}).get("value", "")
-                if value:
-                    session = json.loads(value)
-                    auth = session.get("auth", session)
-                    if auth.get("accessToken"):
-                        self.access_token = auth["accessToken"]
-                        self.refresh_token = auth.get("refreshToken", "")
-                        account = session.get("account", {})
-                        if isinstance(account, dict):
-                            self.department_info = account.get("departmentFullName", "")
-                        self._apply_claims()
-                        log.info("Token extracted from CDP successfully")
-                        self._log_token_info()
-                        self._save_to_file()
-                    elif session.get("error"):
-                        log.error(f"CDP extraction error: {session['error']}")
+            value = result.get("result", {}).get("result", {}).get("value", "")
+            if not value:
+                self.last_error = "cdp_token_missing"
+                return False
+            session = json.loads(value)
+            auth = session.get("auth", session)
+            candidate = auth.get("accessToken", "") if isinstance(auth, dict) else ""
+            if not self._is_token_valid(candidate):
+                self.last_error = "cdp_invalid_token"
+                log.warning("WorkBuddy CDP did not return a valid token")
+                return False
 
+            self.access_token = candidate
+            candidate_refresh = auth.get("refreshToken", "")
+            self.refresh_token = candidate_refresh if isinstance(candidate_refresh, str) else ""
+            account = session.get("account", {})
+            if isinstance(account, dict):
+                self.department_info = account.get("departmentFullName", "")
+            self._apply_claims()
+            self._log_token_info()
+            self._save_to_file()
+            log.info("Token extracted from CDP successfully")
+            return True
+        except asyncio.CancelledError:
+            raise
         except ImportError:
-            log.warning("websockets not installed — run: pip install websockets")
-        except Exception as e:
-            log.error(f"CDP extraction failed: {e}")
+            self.last_error = "websockets_dependency_missing"
+            log.warning("websockets dependency is missing; retry remains active")
+        except Exception as exc:
+            self.last_error = f"cdp_{type(exc).__name__}"
+            log.warning("CDP token extraction unavailable (%s); retry remains active", type(exc).__name__)
+        return False
 
+    async def recover_once(self) -> bool:
+        self.wb_online = _workbuddy_running()
+        self.last_recovery_at = time.time()
+        if self.has_valid_token:
+            self._set_ready()
+            return True
+        return await self.refresh()
+
+    async def recovery_loop(self):
+        while True:
+            try:
+                await self.recover_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._set_waiting(f"recovery_loop_{type(exc).__name__}")
+                log.warning("Background token recovery failed (%s)", type(exc).__name__)
+            await asyncio.sleep(RECOVERY_INTERVAL)
+
+    def health_snapshot(self) -> dict:
+        valid = self.has_valid_token
+        return {
+            "status": "ok" if valid else "degraded",
+            "has_token": valid,
+            "expired": bool(self.access_token) and not valid,
+            "wb_online": self.wb_online,
+            "state": self.state,
+            "retrying": not valid,
+            "retry_interval_seconds": RECOVERY_INTERVAL,
+            "last_error": self.last_error,
+        }
 
 token_mgr = TokenManager()
 
@@ -504,9 +699,15 @@ async def lifespan(_app: FastAPI):
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
     )
     await token_mgr.init()
-    yield
-    await http_pool.aclose()
-    http_pool = None
+    recovery_task = asyncio.create_task(token_mgr.recovery_loop())
+    try:
+        yield
+    finally:
+        recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery_task
+        await http_pool.aclose()
+        http_pool = None
 
 
 app = FastAPI(title="WorkBuddy Proxy", lifespan=lifespan)
@@ -530,6 +731,20 @@ def _verify_api_key(request: Request):
         key = (request.headers.get("X-API-Key") or "").strip()
     if key != PROXY_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _token_unavailable_error() -> HTTPException:
+    if token_mgr.wb_online:
+        code = "WB_TOKEN_UNAVAILABLE"
+        message = "WorkBuddy token is unavailable; automatic recovery is running"
+    else:
+        code = "WB_UNAVAILABLE"
+        message = "WorkBuddy is offline; proxy is waiting and will recover automatically"
+    return HTTPException(
+        status_code=503,
+        detail={"code": code, "message": message},
+        headers={"Retry-After": str(RECOVERY_INTERVAL)},
+    )
 
 
 def _build_headers(access_token: str) -> dict:
@@ -623,7 +838,7 @@ async def chat_completions(request: Request):
 
     access_token = await token_mgr.get_token()
     if not access_token:
-        raise HTTPException(status_code=503, detail="No valid WorkBuddy token")
+        raise _token_unavailable_error()
 
     url = f"{WB_API_BASE}/v2/chat/completions"
     timeout = _timeout_for(model)
@@ -647,6 +862,11 @@ async def _stream_response(
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         access_token = await token_mgr.get_token()
+        if not access_token:
+            code = "WB_TOKEN_UNAVAILABLE" if token_mgr.wb_online else "WB_UNAVAILABLE"
+            yield f"data: {json.dumps({'error': {'code': code, 'message': 'automatic recovery is running'}})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         headers = _build_headers(access_token)
         t_start = time.monotonic()
         has_content = False
@@ -664,17 +884,18 @@ async def _stream_response(
             if resp.status_code == 401:
                 await resp.aclose()
                 log.warning(f"[{model}] Got 401, refreshing token...")
-                await token_mgr.refresh()
-                if attempt < max_attempts:
+                refreshed = await token_mgr.refresh(force=True)
+                if refreshed and attempt < max_attempts:
                     continue
-                yield 'data: {"error":"authentication failed"}\n\n'
+                code = "WB_TOKEN_UNAVAILABLE" if token_mgr.wb_online else "WB_UNAVAILABLE"
+                yield f"data: {json.dumps({'error': {'code': code, 'message': 'automatic recovery is running'}})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
             if resp.status_code != 200:
                 error_body = await resp.aread()
-                log.error(f"[{model}] Upstream {resp.status_code}: {error_body.decode()[:200]}")
-                yield f"data: {json.dumps({'error': error_body.decode()})}\n\n"
+                log.error("[%s] Upstream HTTP %s (response bytes=%s)", model, resp.status_code, len(error_body))
+                yield f"data: {json.dumps({'error': f'upstream HTTP {resp.status_code}'})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
@@ -726,6 +947,8 @@ async def _non_stream_response(
 
     for attempt in range(1, max_attempts + 1):
         access_token = await token_mgr.get_token()
+        if not access_token:
+            raise _token_unavailable_error()
         headers = _build_headers(access_token)
 
         collected_content = ""
@@ -745,10 +968,10 @@ async def _non_stream_response(
             if resp.status_code == 401:
                 await resp.aclose()
                 log.warning(f"[{model}] Got 401, refreshing token...")
-                await token_mgr.refresh()
-                if attempt < max_attempts:
+                refreshed = await token_mgr.refresh(force=True)
+                if refreshed and attempt < max_attempts:
                     continue
-                raise HTTPException(status_code=401, detail="Authentication failed")
+                raise _token_unavailable_error()
 
             if resp.status_code != 200:
                 error_body = await resp.aread()
@@ -828,15 +1051,12 @@ async def _non_stream_response(
 
 @app.get("/health")
 async def health():
-    has_token = bool(token_mgr.access_token)
-    expired = token_mgr._is_expired()
-    return {"status": "ok" if has_token and not expired else "degraded",
-            "has_token": has_token, "expired": expired}
+    return token_mgr.health_snapshot()
 
 
 if __name__ == "__main__":
     log.info(f"Starting WorkBuddy proxy on port {PROXY_PORT}")
     log.info(f"WB version: {WB_VERSION}")
-    log.info(f"API key: {PROXY_API_KEY}")
+    log.info("Proxy API authentication enabled")
     log.info(f"Upstream: {WB_API_BASE}")
     uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")
