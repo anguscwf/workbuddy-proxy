@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py extract_token.py ./
+COPY server.py extract_token.py token_storage.py ./
 
 RUN mkdir -p /app/data
 

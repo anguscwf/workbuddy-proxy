@@ -8,7 +8,7 @@ WorkBuddy Token 提取工具（傻瓜版）
 - 自动检测并安装 Python（如未安装）
 - 自动安装脚本依赖
 - 自动启动 WorkBuddy（调试模式）
-- 自动提取 Token 并保存到桌面
+- 自动提取 Token 并原子保存到仓库 data/token.json
 """
 
 import os
@@ -18,6 +18,8 @@ import json
 import subprocess
 import asyncio
 from pathlib import Path
+
+from token_storage import atomic_write_json
 
 
 def run_cmd(cmd, check=True, shell=True):
@@ -186,10 +188,31 @@ def check_workbuddy_running():
         import httpx
         resp = httpx.get("http://127.0.0.1:9222/json", timeout=2)
         if resp.status_code == 200:
-            return True
+            targets = resp.json()
+            return any(
+                isinstance(target, dict)
+                and target.get("type") == "page"
+                and "workbench" in str(target.get("url", "")).lower()
+                and target.get("webSocketDebuggerUrl")
+                for target in targets
+            )
     except:
         pass
     return False
+
+
+def is_workbuddy_process_running():
+    """Avoid starting a second WorkBuddy instance without user approval."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "/WorkBuddy.app/"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def start_workbuddy_debug():
@@ -197,7 +220,10 @@ def start_workbuddy_debug():
     print("\n正在启动 WorkBuddy（调试模式）...")
 
     workbuddy_path = "/Applications/WorkBuddy.app/Contents/MacOS/Electron"
-    cmd = f'"{workbuddy_path}" --remote-debugging-port=9222'
+    cmd = (
+        f'"{workbuddy_path}" --remote-debugging-address=127.0.0.1 '
+        "--remote-debugging-port=9222"
+    )
 
     try:
         subprocess.Popen(cmd, shell=True)
@@ -232,6 +258,11 @@ def check_requirements():
     print("\n[检查 4/4] 检测 WorkBuddy 运行状态...")
     if check_workbuddy_running():
         print("  ✅ WorkBuddy 已运行（调试模式）")
+    elif is_workbuddy_process_running():
+        print("  ❌ WorkBuddy 正在运行，但没有可用的 9222 调试端口")
+        print("  请保存工作并由你从托盘退出后，再重新运行本工具")
+        print("  本工具不会结束或重启 WorkBuddy")
+        return False
     else:
         print("  ⚠️ WorkBuddy 未运行，正在启动...")
         if not start_workbuddy_debug():
@@ -258,12 +289,6 @@ async def extract_token():
         if t.get("type") == "page" and "workbench" in t.get("url", ""):
             ws_url = t.get("webSocketDebuggerUrl")
             break
-
-    if not ws_url:
-        for t in targets:
-            if t.get("type") == "page":
-                ws_url = t.get("webSocketDebuggerUrl")
-                break
 
     if not ws_url:
         raise Exception("未找到 WorkBuddy 页面")
@@ -301,24 +326,22 @@ async def extract_token():
 
     session = json.loads(value)
     if session.get("error"):
-        raise Exception(f"CDP 错误: {session['error']}")
+        raise Exception("WorkBuddy CDP 未返回可用的登录会话")
 
     return session
 
 
 def save_token(access_token, refresh_token):
-    """保存 Token 到桌面"""
-    desktop = Path.home() / "Desktop"
-    output_file = desktop / "token.txt"
-
-    content = f"""WorkBuddy Token
-生成时间: {time.strftime("%Y-%m-%d %H:%M:%S")}
-
-access_token={access_token}
-refresh_token={refresh_token}
-"""
-
-    output_file.write_text(content, encoding="utf-8")
+    """原子保存 Token 到被 Git 忽略的 data/token.json。"""
+    output_file = Path(__file__).parent / "data" / "token.json"
+    atomic_write_json(
+        output_file,
+        {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
     return output_file
 
 
@@ -362,10 +385,9 @@ def main():
     print("\n" + "=" * 50)
     print("✅ 成功！")
     print("=" * 50)
-    print(f"\n📄 Token 已保存到桌面:")
+    print(f"\n📄 Token 已安全保存（内容已隐藏）:")
     print(f"   {output_file}")
-    print(f"\n🔑 access_token:  {access_token[:30]}...")
-    print(f"🔑 refresh_token: {refresh_token[:30] if refresh_token else 'N/A'}...")
+    print("\n🔑 Token 内容已隐藏，请勿分享保存文件")
     print("\n" + "=" * 50)
 
     input("\n按回车键退出...")

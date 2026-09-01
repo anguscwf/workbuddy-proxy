@@ -53,15 +53,11 @@ if exist "data\token.json" (
 echo.
 echo 请确认以下步骤已完成:
 echo   1. WorkBuddy 已安装并至少登录过一次
-echo   2. WorkBuddy 已用调试模式启动:
+echo   2. 如 WorkBuddy 已运行，请先保存工作并从系统托盘手动退出
+echo   3. WorkBuddy 已用调试模式启动:
 echo.
-echo      方法 A（推荐）: 在文件资源管理器地址栏输入:
-echo        %%LOCALAPPDATA%%\Programs\WorkBuddy
-echo      找到 WorkBuddy.exe，创建快捷方式，右键快捷方式 - 属性
-echo      在"目标"末尾添加:  --remote-debugging-port=9222
-echo.
-echo      方法 B: 打开 PowerShell / CMD，执行:
-echo        "%%LOCALAPPDATA%%\Programs\WorkBuddy\WorkBuddy.exe" --remote-debugging-port=9222
+echo      推荐: 双击 start-wb-debug.bat
+echo      脚本不会结束或重启正在运行的 WorkBuddy
 echo.
 
 set /p READY="WorkBuddy 已用调试模式启动了吗? (y/n): "

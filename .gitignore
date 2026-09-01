@@ -2,6 +2,9 @@ data/*
 !data/.gitkeep
 __pycache__/
 *.pyc
+.venv/
+.test-deps/
+.test-tmp/
 .env
 
 # macOS
