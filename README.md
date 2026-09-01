@@ -40,7 +40,7 @@
 ### 第一步：克隆仓库
 
 ```bash
-git clone https://github.com/buuzzy/workbuddy-proxy.git
+git clone https://github.com/rocky99261/workbuddy-proxy.git
 cd workbuddy-proxy
 ```
 
@@ -48,7 +48,7 @@ cd workbuddy-proxy
 
 ### 第二步：环境配置 & Token 提取
 
-Token 有效期约 **1 年**，正常情况下提取一次即可长期使用。
+Token 的真实有效期以 JWT 的 `exp` 为准；当前环境观测约 **30 天**。代理会在剩余不足 3 天时预警。
 
 <details>
 <summary><b>Windows — 一键配置（推荐）</b></summary>
@@ -58,8 +58,8 @@ Token 有效期约 **1 年**，正常情况下提取一次即可长期使用。
 如果需要手动操作：
 
 ```powershell
-# 1. 以调试模式启动 WorkBuddy
-& "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe" --remote-debugging-port=9222
+# 1. 若 WorkBuddy 已运行，先保存工作并从系统托盘手动退出；再用仓库脚本启动
+.\start-wb-debug.bat
 
 # 常见安装路径：
 #   %LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe
@@ -69,7 +69,7 @@ Token 有效期约 **1 年**，正常情况下提取一次即可长期使用。
 python -m pip install -r requirements.txt
 python extract_token.py --save
 
-# 3. 看到 "已保存到 data\token.json" 后，可以关闭 WorkBuddy
+# 3. 看到 "已保存到 data\token.json" 后，运行中的代理会在 10 秒内热加载
 ```
 
 </details>
@@ -78,8 +78,8 @@ python extract_token.py --save
 <summary><b>macOS — 手动配置</b></summary>
 
 ```bash
-# 1. 以调试模式启动 WorkBuddy
-/Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-port=9222
+# 1. 以仅监听本机回环地址的调试模式启动 WorkBuddy
+/Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
 
 # 2. 新开一个终端，安装依赖并提取 Token
 pip3 install -r requirements.txt
@@ -130,7 +130,7 @@ Invoke-RestMethod http://127.0.0.1:19090/health
 curl http://127.0.0.1:19090/health
 ```
 
-返回 `{"status":"ok","has_token":true,"expired":false}` 即表示一切正常。
+返回 `{"status":"ok","has_token":true,"expired":false,"state":"ready",...}` 即表示 Token 层正常；真实调用仍需用一次最小聊天请求确认上游可用。
 
 ---
 
@@ -165,9 +165,9 @@ Docker Desktop 默认会随 Windows 启动，容器配置了 `restart: unless-st
 
 适合不想装 Docker、直接用 Python 运行的场景。
 
-**1. 创建启动脚本**
+**1. 使用守护脚本**
 
-项目已包含 `start.ps1`，它会自动检查依赖、提取 Token 并启动服务。
+项目已包含 `watchdog.ps1`：登录后启动 proxy，proxy 崩溃时自动拉起；它不会结束、启动或重启 WorkBuddy。先人工安装依赖并至少成功启动一次 proxy。
 
 **2. 配置任务计划**
 
@@ -176,7 +176,7 @@ Docker Desktop 默认会随 Windows 启动，容器配置了 `restart: unless-st
 ```powershell
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\path\to\workbuddy-proxy\start.ps1`"" `
+    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"C:\path\to\workbuddy-proxy\watchdog.ps1`" -Port 19090" `
     -WorkingDirectory "C:\path\to\workbuddy-proxy"
 
 $trigger = New-ScheduledTaskTrigger -AtLogon
@@ -186,7 +186,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1)
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask `
     -TaskName "WorkBuddyProxy" `
@@ -196,7 +197,8 @@ Register-ScheduledTask `
     -Description "WorkBuddy OpenAI-compatible reverse proxy"
 ```
 
-> **注意**：将 `C:\path\to\workbuddy-proxy` 替换为你的实际项目路径。
+> **注意**：将 `C:\path\to\workbuddy-proxy` 替换为你的实际项目路径；若 `.env` 的 `PROXY_PORT` 不是 19090，任务参数 `-Port` 也要保持一致。
+> 仓库只交付脚本，不会替你注册、启动或修改计划任务；以上命令必须由用户人工确认后执行。
 
 **管理任务：**
 
@@ -327,47 +329,66 @@ pm2 startup
 
 | Token | 有效期 | 说明 |
 |-------|--------|------|
-| Access Token | ~1 年 | 主认证令牌 |
-| Refresh Token | 更长 | 用于自动续期 Access Token |
+| Access Token | 以 JWT `exp` 为准；当前观测约 30 天 | 主认证令牌；`/health` 返回 `token_exp` 和 `days_remaining` |
+| Refresh Token | 可能为空 | 有值时优先用于续期；为空时只能通过本机 WorkBuddy CDP 重新提取 |
 
 ### 自动续期
 
-代理内置了自动续期逻辑：Access Token 到期前 5 分钟，会用 Refresh Token 自动调用 WorkBuddy API 获取新 Token，**全程无需人工干预**。
+代理每 10 秒检查一次恢复条件：重新读取 `data/token.json`，必要时使用 Refresh Token 或本机 CDP 获取新 Token。外部执行 `extract_token.py --save` 后不必重启 proxy，最多 10 秒恢复 `ready`。
+
+Token 剩余不足 3 天时，`/health.status` 变为 `warning`，并且日志每小时最多告警一次。连续 3 次恢复失败会原子写入 `data/ALERT`；恢复后自动清除该活动告警文件。
+
+### token 断链自救 SOP
+
+Windows 上按以下顺序执行，脚本不会结束或重启 WorkBuddy：
+
+1. **保存工作，从系统托盘退出 WorkBuddy。** 不要使用强制结束进程；只有用户确认退出后，调试启动参数才能生效。
+2. **用调试端口重新启动 WorkBuddy。** 在仓库根目录双击 `start-wb-debug.bat`，或运行：
+
+   ```powershell
+   .\start-wb-debug.bat
+   ```
+
+   若 9222 被其他程序占用，可改用 `start-wb-debug.bat 9223`；同时把 `.env` 的 `CDP_URL` 改为 `http://127.0.0.1:9223`，下一步也加 `--port 9223`。`token.json` 可以热加载，但 `.env` 只在 proxy 启动时读取，因此修改 `CDP_URL` 后需要重启 **proxy/watchdog（不是 WorkBuddy）** 一次。
+
+3. **重新提取并保存。** 新开 PowerShell，在仓库根目录运行：
+
+   ```powershell
+   python .\extract_token.py --save
+   ```
+
+   等待最多 10 秒后检查：
+
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:19090/health
+   ```
+
+   目标为 `status=ok`、`has_token=true`、`expired=false`、`state=ready`、`retrying=false`。随后发送一次最小聊天请求确认上游认证；`/v1/models` 只返回静态列表，不能作为认证验收。
+
+### 故障码与处理
+
+| `last_error` | 含义 | 操作 |
+|---|---|---|
+| `wb_offline` | WorkBuddy 未运行 | 手动启动；需要续期时执行上方 SOP |
+| `wb_no_debug_port` | WorkBuddy 在运行，但配置的 CDP 端口不可用或不是 WorkBuddy workbench | 保存工作、托盘退出，再运行 `start-wb-debug.bat` |
+| `token_expired` | Token 已过期、损坏，或 CDP 没有返回新 Token | 执行上方 SOP |
+| `upstream_401` | 上游在强制刷新并重试后仍拒绝 Token | 执行上方 SOP |
+| `upstream_quota` | 上游额度耗尽或限流 | 检查账户配额或稍后再试；不要重复提取 Token |
+
+> `wb_offline` / `wb_no_debug_port` 的进程区分仅在 proxy 与 WorkBuddy 同机原生运行时可靠。Docker 通过 `host.docker.internal` 访问宿主 CDP，无法探测宿主进程，因此端口不可达时按 `wb_no_debug_port` 报告并给出同一套可操作 SOP。
 
 ### 手动更新 Token（当自动续期也失效时）
 
-如果长时间未使用导致 Refresh Token 也过期，需要手动重新提取：
-
-**Windows：**
-
-```powershell
-# 1. 调试模式启动 WorkBuddy
-& "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe" --remote-debugging-port=9222
-
-# 2. 新开 PowerShell，重新提取 Token
-python extract_token.py --save
-
-# 3. 重启服务
-docker compose restart
-# 或者如果用 Python 直接运行，重启 start.ps1
-
-# 4. 验证
-Invoke-RestMethod http://127.0.0.1:19090/health
-```
-
-**macOS：**
+上方「token 断链自救 SOP」是 Windows 的标准手动恢复流程。macOS 可按对应方式重新开启 CDP 并提取：
 
 ```bash
-# 1. 调试模式启动 WorkBuddy
-/Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-port=9222
+# 1. 以仅监听本机回环地址的调试模式启动 WorkBuddy
+/Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
 
 # 2. 重新提取 Token
 python3 extract_token.py --save
 
-# 3. 重启服务
-docker compose restart
-
-# 4. 验证
+# 3. 等待 10 秒并验证
 curl http://127.0.0.1:19090/health
 ```
 
@@ -381,8 +402,9 @@ curl http://127.0.0.1:19090/health
 | 返回 | 含义 |
 |------|------|
 | `{"status":"ok", ...}` | 正常，Token 有效 |
+| `{"status":"warning", "days_remaining":2.5, ...}` | Token 剩余不足 3 天，应安排执行 SOP |
 | `{"status":"degraded", "has_token":false, ...}` | 无 Token，需要提取 |
-| `{"status":"degraded", "expired":true, ...}` | Token 过期，等待自动续期或手动更新 |
+| `{"status":"degraded", "expired":true, ...}` | Token 过期；代理每 10 秒自动重试，也可立即执行 SOP |
 
 ---
 
@@ -395,6 +417,10 @@ curl http://127.0.0.1:19090/health
 | `PROXY_PORT` | `19090` | 代理监听端口 |
 | `PROXY_API_KEY` | `wb-proxy-key` | 客户端使用的 API Key |
 | `CDP_URL` | `http://127.0.0.1:9222` | CDP 调试地址 |
+| `TOKEN_WARNING_DAYS` | `3` | 少于该天数时进入 `warning` |
+| `TOKEN_WARNING_LOG_INTERVAL_SECONDS` | `3600` | Token 临期日志告警最短间隔 |
+| `TOKEN_RETRY_INTERVAL_SECONDS` | `10` | Token 断链后的自动恢复间隔 |
+| `ALERT_FAILURE_THRESHOLD` | `3` | 连续恢复失败多少次后写 `data/ALERT` |
 
 > User ID、Enterprise ID、Domain 会从 JWT Token **自动解析**，无需手动配置。
 

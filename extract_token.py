@@ -16,6 +16,8 @@ import json
 import sys
 from pathlib import Path
 
+from token_storage import atomic_write_json
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -33,6 +35,7 @@ async def extract(cdp_port: int = 9222) -> dict | None:
         except httpx.ConnectError:
             print(f"无法连接 CDP ({base})，请确认 WorkBuddy 已用调试模式启动")
             return None
+        resp.raise_for_status()
         targets = resp.json()
 
     ws_url = None
@@ -41,12 +44,7 @@ async def extract(cdp_port: int = 9222) -> dict | None:
             ws_url = t.get("webSocketDebuggerUrl")
             break
     if not ws_url:
-        for t in targets:
-            if t.get("type") == "page":
-                ws_url = t.get("webSocketDebuggerUrl")
-                break
-    if not ws_url:
-        print("未找到可用的 CDP 页面目标")
+        print("该端口没有 WorkBuddy workbench；可能被其他程序占用")
         return None
 
     try:
@@ -85,7 +83,7 @@ async def extract(cdp_port: int = 9222) -> dict | None:
 
     session = json.loads(value)
     if session.get("error"):
-        print(f"CDP 错误: {session['error']}")
+        print("WorkBuddy CDP 未返回可用的登录会话")
         return None
 
     return session
@@ -110,18 +108,16 @@ def main():
         print("未获取到 accessToken")
         sys.exit(1)
 
-    print(f"accessToken:  {access_token[:40]}...  (len={len(access_token)})")
-    print(f"refreshToken: {refresh_token[:40]}...  (len={len(refresh_token)})")
+    print("Token 提取成功（内容已隐藏）")
 
     if args.save:
         import time
         out = Path(__file__).parent / "data" / "token.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({
+        atomic_write_json(out, {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }, indent=2))
+        })
         print(f"\n已保存到 {out}")
 
 

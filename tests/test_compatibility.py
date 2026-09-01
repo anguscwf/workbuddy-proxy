@@ -160,17 +160,17 @@ class CompatibilityTester:
                 "workbench" in t.get("url", "") for t in targets if t.get("type") == "page"
             )
 
-            if targets:
+            if workbench_found:
                 self.results.append(TestResult(
                     name, Status.PASS,
-                    f"找到 {len(targets)} 个 CDP 目标" + ("（含 Workbench）" if workbench_found else ""),
+                    f"找到 {len(targets)} 个 CDP 目标（含 Workbench）",
                     {"target_count": len(targets), "workbench_found": workbench_found}
                 ))
             else:
                 self.results.append(TestResult(
                     name, Status.FAIL,
-                    "CDP 连接成功但未找到任何目标",
-                    {"response": targets}
+                    "CDP 端口可达，但没有 WorkBuddy workbench（可能被其他程序占用）",
+                    {"target_count": len(targets), "workbench_found": False}
                 ))
         except httpx.ConnectError as e:
             elapsed = (time.monotonic() - start) * 1000
@@ -255,14 +255,19 @@ class CompatibilityTester:
                 payload = jwt.decode(access_token, options={"verify_signature": False})
                 exp = payload.get("exp", 0)
                 exp_date = datetime.fromtimestamp(exp).strftime("%Y-%m-%d %H:%M:%S")
-                is_expired = time.time() > (exp - 300)
+                is_expired = time.time() >= exp
+                needs_refresh = time.time() >= (exp - 300)
 
                 self.access_token = access_token
 
                 self.results.append(TestResult(
                     name, Status.PASS if not is_expired else Status.WARN,
-                    f"Token {'有效' if not is_expired else '即将过期'}，过期时间: {exp_date}",
-                    {"expires": exp_date, "has_refresh": bool(refresh_token)}
+                    f"Token {'有效' if not is_expired else '已过期'}，过期时间: {exp_date}",
+                    {
+                        "expires": exp_date,
+                        "has_refresh": bool(refresh_token),
+                        "needs_refresh": needs_refresh,
+                    }
                 ))
             except Exception as e:
                 self.results.append(TestResult(
@@ -399,7 +404,9 @@ class CompatibilityTester:
                     success = True
                     break
                 else:
-                    error_msg = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    error_msg = (
+                        f"HTTP {resp.status_code}（响应正文已隐藏）"
+                    )
             except httpx.TimeoutException:
                 error_msg = f"模型 {model} 调用超时"
             except Exception as e:

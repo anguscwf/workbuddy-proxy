@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """
-从远程 WorkBuddy 实例提取 Token。
+通过本机回环地址或 SSH 本地端口转发提取 WorkBuddy Token。
 
 支持两种模式：
 1. 本地模式：自动检测本机 WorkBuddy
-2. 远程模式：连接远程 Mac 的 CDP 端口
+2. SSH 隧道模式：先把远程 Mac 的 CDP 转发到本机回环端口
 
 用法:
     # 本机自动检测
     python extract_token_remote.py
 
-    # 远程 Mac（需要先在目标机器启动 WorkBuddy 调试模式）
-    python extract_token_remote.py --host 192.168.1.100 --port 9222 --save
+    # 远程 Mac：先建立 SSH 本地转发，再连接本机端口
+    ssh -N -L 9223:127.0.0.1:9222 user@remote-mac
+    python extract_token_remote.py --host 127.0.0.1 --port 9223 --save
 
 前置条件（远程 Mac）：
-    /Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-port=9222
+    /Applications/WorkBuddy.app/Contents/MacOS/Electron \
+        --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222
 
-    注意：可能需要配置防火墙允许 9222 端口入站。
+安全约束：CDP 不提供可靠认证，禁止把 9222 直接暴露到局域网或公网。
 """
 
 import argparse
 import asyncio
 import json
 import sys
-import time
 from pathlib import Path
+
+from token_storage import atomic_write_json
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -41,6 +44,9 @@ except ImportError:
 
 
 async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | None:
+    if cdp_host not in ("127.0.0.1", "localhost"):
+        print("❌ 拒绝直连远程 CDP；请先建立 SSH 本地端口转发")
+        return None
     base = f"http://{cdp_host}:{cdp_port}"
 
     print(f"正在连接 CDP ({base})...")
@@ -51,8 +57,12 @@ async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | N
         except httpx.ConnectError as e:
             print(f"❌ 无法连接 CDP: {e}")
             print(f"\n请确保远程 Mac 已启动 WorkBuddy 调试模式：")
-            print(f"  /Applications/WorkBuddy.app/Contents/MacOS/Electron --remote-debugging-port={cdp_port}")
+            print(
+                "  /Applications/WorkBuddy.app/Contents/MacOS/Electron "
+                f"--remote-debugging-address=127.0.0.1 --remote-debugging-port={cdp_port}"
+            )
             return None
+        resp.raise_for_status()
         targets = resp.json()
 
     ws_url = None
@@ -60,23 +70,11 @@ async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | N
         if t.get("type") == "page" and "workbench" in t.get("url", ""):
             ws_url = t.get("webSocketDebuggerUrl")
             if ws_url:
-                if cdp_host != "127.0.0.1" and cdp_host != "localhost":
-                    ws_url = ws_url.replace("127.0.0.1", cdp_host)
                 print(f"✅ 找到 Workbench 页面")
                 break
 
     if not ws_url:
-        for t in targets:
-            if t.get("type") == "page":
-                ws_url = t.get("webSocketDebuggerUrl")
-                if ws_url:
-                    if cdp_host != "127.0.0.1" and cdp_host != "localhost":
-                        ws_url = ws_url.replace("127.0.0.1", cdp_host)
-                    print(f"⚠️  未找到 Workbench，找到通用页面")
-                    break
-
-    if not ws_url:
-        print("❌ 未找到可用的 CDP 页面目标")
+        print("❌ 该端口没有 WorkBuddy workbench；可能被其他程序占用")
         return None
 
     print(f"正在通过 WebSocket 提取 Token...")
@@ -112,7 +110,7 @@ async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | N
 
     session = json.loads(value)
     if session.get("error"):
-        print(f"❌ CDP 错误: {session['error']}")
+        print("❌ WorkBuddy CDP 未返回可用的登录会话")
         return None
 
     return session
@@ -120,24 +118,25 @@ async def extract(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> dict | N
 
 def main():
     parser = argparse.ArgumentParser(
-        description="从 WorkBuddy 提取 Token（支持远程）",
+        description="从 WorkBuddy 提取 Token（远程时仅支持 SSH 本地转发）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   # 本机自动检测
   python extract_token_remote.py
 
-  # 远程 Mac
-  python extract_token_remote.py --host 192.168.1.100 --save
+  # 远程 Mac（另一个终端保持 SSH 隧道运行）
+  ssh -N -L 9223:127.0.0.1:9222 user@remote-mac
+  python extract_token_remote.py --host 127.0.0.1 --port 9223 --save
 
   # 自定义端口
-  python extract_token_remote.py --host 192.168.1.100 --port 9223 --save
+  python extract_token_remote.py --host 127.0.0.1 --port 9223 --save
         """
     )
     parser.add_argument(
         "--host", "-H",
         default="127.0.0.1",
-        help="CDP 主机地址 (默认: 127.0.0.1)"
+        help="CDP 主机地址；安全起见只允许 127.0.0.1/localhost"
     )
     parser.add_argument(
         "--port", "-p",
@@ -159,11 +158,11 @@ def main():
     is_remote = args.host not in ("127.0.0.1", "localhost")
 
     if is_remote:
-        print(f"\n🔗 远程模式")
-        print(f"   目标: {args.host}:{args.port}")
-        print(f"   注意: 确保目标 Mac 已启动 WorkBuddy 调试模式\n")
+        parser.error(
+            "拒绝直连远程 CDP：请用 SSH -L 转发到 127.0.0.1 后再运行"
+        )
     else:
-        print(f"\n🔗 本地模式\n")
+        print(f"\n🔗 本机/SSH 本地转发模式\n")
 
     session = asyncio.run(extract(args.host, args.port))
     if not session:
@@ -178,28 +177,19 @@ def main():
         sys.exit(1)
 
     print(f"\n✅ Token 提取成功！")
-    print(f"   accessToken:  {access_token[:40]}... (len={len(access_token)})")
-    print(f"   refreshToken: {refresh_token[:40] if refresh_token else 'N/A'}... "
-          f"(len={len(refresh_token) if refresh_token else 0})")
+    print("   Token 内容已隐藏")
 
     if args.save or args.output:
         import time as time_module
         out_path = Path(args.output) if args.output else Path(__file__).parent / "data" / "token.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps({
+        atomic_write_json(out_path, {
             "access_token": access_token,
             "refresh_token": refresh_token,
             "saved_at": time_module.strftime("%Y-%m-%d %H:%M:%S"),
-            "source_host": args.host if is_remote else "localhost",
+            "source_host": "localhost",
             "source_port": args.port,
-        }, indent=2))
+        })
         print(f"\n💾 已保存到: {out_path}")
-
-    if is_remote:
-        print(f"\n📋 接下来在本地 Mac 上：")
-        print(f"   1. 将生成的 data/token.json 复制到本项目")
-        print(f"   2. 启动代理: python server.py")
-
 
 if __name__ == "__main__":
     main()
