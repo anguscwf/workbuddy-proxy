@@ -40,7 +40,9 @@ async def extract(cdp_port: int = 9222) -> dict | None:
 
     ws_url = None
     for t in targets:
-        if t.get("type") == "page" and "workbench" in t.get("url", ""):
+        url = t.get("url", "")
+        # 兼容 WB 新旧版本页面 URL：旧版含 workbench，新版为 app.asar/renderer/index.html
+        if t.get("type") == "page" and ("workbench" in url or "app.asar/renderer/index.html" in url):
             ws_url = t.get("webSocketDebuggerUrl")
             break
     if not ws_url:
@@ -60,10 +62,24 @@ async def extract(cdp_port: int = 9222) -> dict | None:
                 "expression": """
                     (async () => {
                         try {
-                            const s = await window.vscode.ipcRenderer.invoke(
-                                'vscode:genie:auth:getSession'
-                            );
-                            return JSON.stringify(s);
+                            const providers = window.__GENIE_DEFAULT_APP_PROVIDERS__;
+                            if (providers?.auth?.getToken) {
+                                const token = await providers.auth.getToken();
+                                return JSON.stringify({
+                                    accessToken: typeof token === 'string'
+                                        ? token
+                                        : (token?.accessToken || token?.token || ''),
+                                    refreshToken: typeof token === 'object'
+                                        ? (token?.refreshToken || '')
+                                        : ''
+                                });
+                            }
+                            if (window.vscode?.ipcRenderer?.invoke) {
+                                return JSON.stringify(await window.vscode.ipcRenderer.invoke(
+                                    'vscode:genie:auth:getSession'
+                                ));
+                            }
+                            throw new Error('No supported WorkBuddy auth API found');
                         } catch(e) {
                             return JSON.stringify({error: e.message});
                         }
