@@ -2,9 +2,25 @@
 import hashlib
 import json
 import re
+from pathlib import Path
 
 PROTOCOL = "ngl-evaluation-identity-v1"
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
+IDENTITY_SOURCE_MANIFEST = ("server.py", "evaluation_identity.py", "workbuddy_cdp.py")
+IDENTITY_SOURCE_ALGORITHM = "sha256-ordered-raw-files-v1"
+
+
+def source_fingerprints(base_dir):
+    """Bind the reviewed raw source bytes at startup; missing files fail closed."""
+    parts = [(Path(base_dir) / name).read_bytes() for name in IDENTITY_SOURCE_MANIFEST]
+    return {
+        "proxySourceSha256": hashlib.sha256(b"".join(parts)).hexdigest(),
+        "identitySourceManifest": list(IDENTITY_SOURCE_MANIFEST),
+        "identitySourceAlgorithm": IDENTITY_SOURCE_ALGORITHM,
+        "legacyProxySourceSha256": hashlib.sha256(b"".join(parts[:2])).hexdigest(),
+        "legacySourceManifest": list(IDENTITY_SOURCE_MANIFEST[:2]),
+        "legacySourceAlgorithm": "sha256-two-raw-files-v0-diagnostic-only",
+    }
 
 
 class IdentityError(ValueError):
@@ -14,13 +30,20 @@ class IdentityError(ValueError):
         self.diagnostics = diagnostics or {}
 
 
-def snapshot(mappings, source_sha256):
+def snapshot(mappings, source_sha256, *, source_metadata=None):
     ordered = dict(sorted(mappings.items()))
     encoded = json.dumps(ordered, separators=(",", ":"), ensure_ascii=True).encode()
-    return {"protocol": PROTOCOL, "mappings": ordered,
+    result = {"protocol": PROTOCOL, "mappings": ordered,
             "mappingDigest": hashlib.sha256(encoded).hexdigest(),
             "proxySourceSha256": source_sha256,
             "maxUpstreamAttempts": 1, "requiresObservedModel": True}
+    if source_metadata is not None:
+        if source_metadata["proxySourceSha256"] != source_sha256:
+            raise ValueError("Source metadata does not match the bound fingerprint")
+        for key in ("identitySourceManifest", "identitySourceAlgorithm", "legacyProxySourceSha256",
+                    "legacySourceManifest", "legacySourceAlgorithm"):
+            result[key] = source_metadata[key]
+    return result
 
 
 class ObservedIdentity:

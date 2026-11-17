@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py evaluation_identity.py extract_token.py token_storage.py ./
+COPY workbuddy_cdp.py ./
 
 RUN mkdir -p /app/data
 

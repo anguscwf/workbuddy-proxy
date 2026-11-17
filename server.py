@@ -40,7 +40,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from token_storage import atomic_write_json, locked_path
-from evaluation_identity import IdentityError, ObservedIdentity, PROTOCOL as EVALUATION_PROTOCOL, snapshot as identity_snapshot
+from workbuddy_cdp import AUTH_EXPRESSION, select_workbuddy_target
+from evaluation_identity import IdentityError, ObservedIdentity, PROTOCOL as EVALUATION_PROTOCOL, snapshot as identity_snapshot, source_fingerprints
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,9 +51,8 @@ logging.basicConfig(
 log = logging.getLogger("wb-proxy")
 
 BASE_DIR = Path(__file__).parent
-EVALUATION_SOURCE_SHA256 = hashlib.sha256(
-    Path(__file__).read_bytes() + (BASE_DIR / "evaluation_identity.py").read_bytes()
-).hexdigest()
+EVALUATION_SOURCE = source_fingerprints(BASE_DIR)
+EVALUATION_SOURCE_SHA256 = EVALUATION_SOURCE["proxySourceSha256"]
 
 # README / .env.example：本地与 Docker 均通过 .env 配置；已有环境变量优先（不 override）
 try:
@@ -192,7 +192,10 @@ HEADERS_TEMPLATE = {
     "User-Agent": f"CodeBuddyIDE/{WB_VERSION} coding-copilot/{WB_VERSION}",
 }
 
-REASONING_MODELS = {"deepseek-r1", "deepseek-r1-0528-lkeap", "hunyuan-2.0-thinking-ioa"}
+REASONING_MODELS = {
+    "deepseek-r1", "deepseek-r1-0528-lkeap", "hunyuan-2.0-thinking-ioa",
+    "hy4-preview-ioa", "gpt-6-luna",
+}
 DEFAULT_TIMEOUT = int(os.getenv("WB_TIMEOUT", "120"))
 REASONING_TIMEOUT = int(os.getenv("WB_REASONING_TIMEOUT", "300"))
 
@@ -1269,17 +1272,8 @@ class TokenManager:
             if not isinstance(targets, list):
                 raise ValueError("unexpected CDP target list")
 
-            ws_url = next(
-                (
-                    target.get("webSocketDebuggerUrl")
-                    for target in targets
-                    if isinstance(target, dict)
-                    and target.get("type") == "page"
-                    and "workbench" in str(target.get("url", "")).lower()
-                    and target.get("webSocketDebuggerUrl")
-                ),
-                None,
-            )
+            target = select_workbuddy_target(targets)
+            ws_url = target["webSocketDebuggerUrl"] if target else None
             if not ws_url:
                 code = await self._classify_cdp_failure()
                 self._set_error(code)
@@ -1297,32 +1291,7 @@ class TokenManager:
                         "id": 1,
                         "method": "Runtime.evaluate",
                         "params": {
-                            "expression": """
-                                (async () => {
-                                    try {
-                                        const providers = window.__GENIE_DEFAULT_APP_PROVIDERS__;
-                                        if (providers?.auth?.getToken) {
-                                            const token = await providers.auth.getToken();
-                                            return JSON.stringify({
-                                                accessToken: typeof token === 'string'
-                                                    ? token
-                                                    : (token?.accessToken || token?.token || ''),
-                                                refreshToken: typeof token === 'object'
-                                                    ? (token?.refreshToken || '')
-                                                    : ''
-                                            });
-                                        }
-                                        if (window.vscode?.ipcRenderer?.invoke) {
-                                            return JSON.stringify(await window.vscode.ipcRenderer.invoke(
-                                                'vscode:genie:auth:getSession'
-                                            ));
-                                        }
-                                        throw new Error('No supported WorkBuddy auth API found');
-                                    } catch(e) {
-                                        return JSON.stringify({error: e.message});
-                                    }
-                                })()
-                            """,
+                            "expression": AUTH_EXPRESSION,
                             "awaitPromise": True,
                             "returnByValue": True,
                         },
@@ -1536,6 +1505,7 @@ MODELS = [
     {"id": "deepseek-r1-0528-lkeap", "name": "DeepSeek-R1-0528-LKEAP"},
     {"id": "deepseek-v3-2-volc-ioa", "name": "DeepSeek-V3-2-Volc"},
     # GPT (5.1–5.4 removed: HTTP 400 on WorkBuddy backend)
+    {"id": "gpt-6-luna", "name": "GPT-6-Luna"},
     # Claude
     {"id": "claude-4.5", "name": "Claude-Sonnet-4.5"},
     {"id": "claude-opus-4.5", "name": "Claude-Opus-4.5"},
@@ -1556,6 +1526,7 @@ MODELS = [
     {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo"},
     {"id": "glm-5v-turbo-ioa", "name": "GLM-5v-Turbo-IOA"},
     # Hunyuan
+    {"id": "hy4-preview-ioa", "name": "Hy4 preview"},
     {"id": "hunyuan-2.0-instruct", "name": "Hunyuan-2.0-Instruct"},
     {"id": "hunyuan-2.0-instruct-ioa", "name": "Hunyuan-2.0-Instruct-IOA"},
     {"id": "hunyuan-2.0-thinking-ioa", "name": "Hunyuan-2.0-Thinking"},
@@ -1788,7 +1759,7 @@ async def chat_completions(request: Request):
 
 def _evaluation_snapshot():
     mappings = {key: resolve_allowed_model(key) for key in ADVERTISED_MODEL_IDS}
-    return identity_snapshot(mappings, EVALUATION_SOURCE_SHA256)
+    return identity_snapshot(mappings, EVALUATION_SOURCE_SHA256, source_metadata=EVALUATION_SOURCE)
 
 
 def _evaluation_error(code, status=502, diagnostics=None):
