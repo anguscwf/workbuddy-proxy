@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -39,6 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from token_storage import atomic_write_json, locked_path
+from evaluation_identity import IdentityError, ObservedIdentity, PROTOCOL as EVALUATION_PROTOCOL, snapshot as identity_snapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +50,9 @@ logging.basicConfig(
 log = logging.getLogger("wb-proxy")
 
 BASE_DIR = Path(__file__).parent
+EVALUATION_SOURCE_SHA256 = hashlib.sha256(
+    Path(__file__).read_bytes() + (BASE_DIR / "evaluation_identity.py").read_bytes()
+).hexdigest()
 
 # README / .env.example：本地与 Docker 均通过 .env 配置；已有环境变量优先（不 override）
 try:
@@ -1781,6 +1786,71 @@ async def chat_completions(request: Request):
     return await _non_stream_response(url, wb_body, model, timeout, t_start)
 
 
+def _evaluation_snapshot():
+    mappings = {key: resolve_allowed_model(key) for key in ADVERTISED_MODEL_IDS}
+    return identity_snapshot(mappings, EVALUATION_SOURCE_SHA256)
+
+
+def _evaluation_error(code, status=502, diagnostics=None):
+    error = {"code": code, "message": "Strict evaluation could not be verified"}
+    if diagnostics is not None:
+        error["diagnostics"] = diagnostics
+    return JSONResponse(status_code=status, content={"error": error})
+
+
+@app.get("/v1/ngl/evaluation/snapshot")
+async def evaluation_snapshot(request: Request):
+    _verify_api_key(request)
+    return _evaluation_snapshot()
+
+
+@app.post("/v1/ngl/evaluation/chat/completions")
+async def evaluation_chat_completions(request: Request):
+    _verify_api_key(request)
+    payload = await request.json()
+    if not isinstance(payload, dict) or set(payload) != {"body", "binding"}:
+        return _evaluation_error("AI_EVALUATION_INPUT_INVALID", 400)
+    body, binding = payload["body"], payload["binding"]
+    if not isinstance(body, dict) or not isinstance(binding, dict):
+        return _evaluation_error("AI_EVALUATION_INPUT_INVALID", 400)
+    current = _evaluation_snapshot()
+    try:
+        model = resolve_allowed_model(body.get("model"))
+    except ValueError:
+        return _evaluation_error("AI_MODEL_NOT_AVAILABLE", 400)
+    expected = {"protocol": EVALUATION_PROTOCOL, "requestedModel": body["model"], "resolvedModel": model,
+                "mappingDigest": current["mappingDigest"], "proxySourceSha256": current["proxySourceSha256"]}
+    if any(binding.get(key) != value for key, value in expected.items()):
+        return _evaluation_error("AI_EVALUATION_CONTEXT_CHANGED", 409)
+    allowed = {"model", "messages", "max_tokens", "temperature", "stream", "n", "thinking"}
+    messages = body.get("messages")
+    temperature = body.get("temperature")
+    if (set(body) - allowed or len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()) > 262144
+            or not isinstance(messages, list) or not 1 <= len(messages) <= 16
+            or any(not isinstance(message, dict) or set(message) != {"role", "content"}
+                   or not isinstance(message["role"], str) or message["role"] not in {"system", "user", "assistant"} or not isinstance(message["content"], str) for message in messages)
+            or type(body.get("max_tokens")) is not int or not 1 <= body["max_tokens"] <= 16384
+            or type(temperature) not in (int, float) or not math.isfinite(temperature) or not 0 <= temperature <= 2
+            or body.get("stream", False) is not False or type(body.get("n", 1)) is not int or body.get("n", 1) != 1
+            or ("thinking" in body and (body["thinking"] != {"type": "disabled"} or not model.lower().startswith("deepseek-")))):
+        return _evaluation_error("AI_EVALUATION_INPUT_INVALID", 400)
+    wb_body = {key: value for key, value in body.items() if key != "stream"}
+    wb_body.update(model=model, stream=True)
+    attempt_state = {"upstreamAttempts": 0}
+    try:
+        return await _non_stream_response(f"{WB_API_BASE}/v2/chat/completions", wb_body, model,
+                                          _timeout_for(model), time.monotonic(), evaluation_binding=expected,
+                                          evaluation_attempt_state=attempt_state)
+    except IdentityError as error:
+        return _evaluation_error(error.code, diagnostics={**expected, **attempt_state, **error.diagnostics})
+    except HTTPException as error:
+        detail = error.detail if isinstance(error.detail, dict) else {}
+        code = detail.get("code")
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", code, flags=re.ASCII):
+            code = f"AI_UPSTREAM_HTTP_{error.status_code}"
+        return _evaluation_error(code, error.status_code, diagnostics={**expected, **attempt_state})
+
+
 # ---------------------------------------------------------------------------
 # Streaming path
 # ---------------------------------------------------------------------------
@@ -1944,9 +2014,11 @@ async def _stream_response(
 # Non-streaming path
 # ---------------------------------------------------------------------------
 async def _non_stream_response(
-    url: str, body: dict, model: str, timeout: float, t_start: float
+    url: str, body: dict, model: str, timeout: float, t_start: float,
+    *, evaluation_binding: dict | None = None,
+    evaluation_attempt_state: dict | None = None,
 ) -> JSONResponse:
-    max_attempts = 2
+    max_attempts = 1 if evaluation_binding is not None else 2
 
     for attempt in range(1, max_attempts + 1):
         access_token = await token_mgr.get_token()
@@ -1968,8 +2040,13 @@ async def _non_stream_response(
         tool_calls_map: dict[int, dict] = {}
         finish_reason = "stop"
         resp_model = model
+        observed_identity = ObservedIdentity(model) if evaluation_binding is not None else None
+        terminal_reason = None
+        saw_done = False
         usage = {}
 
+        if evaluation_attempt_state is not None:
+            evaluation_attempt_state["upstreamAttempts"] += 1
         resp = await _upstream_stream(url, headers, body, timeout)
         if resp is None:
             log.error(f"[{model}] Upstream timeout (attempt {attempt})")
@@ -1980,7 +2057,7 @@ async def _non_stream_response(
         try:
             if resp.status_code == 401:
                 await resp.aclose()
-                log.warning(f"[{model}] Got 401, refreshing token...")
+                log.warning("[%s] Upstream authentication rejected (attempt %d)", model, attempt)
                 if attempt < max_attempts:
                     recovered, error_code = (
                         await _recover_after_upstream_auth_failure(access_token)
@@ -2035,12 +2112,17 @@ async def _non_stream_response(
 
             auth_retry_requested = False
             async for line in resp.aiter_lines():
+                if observed_identity is not None and (line.startswith(":") or line.startswith(("event:", "id:", "retry:"))):
+                    continue
                 text = (
                     line[5:].lstrip(" ").strip()
                     if line.startswith("data:")
                     else line.strip()
                 )
-                if not text or text == "[DONE]":
+                if text == "[DONE]":
+                    saw_done = True
+                    continue
+                if not text:
                     continue
                 is_error, error_code = _inspect_sse_error(text)
                 if is_error:
@@ -2078,8 +2160,23 @@ async def _non_stream_response(
                     )
                 try:
                     chunk = json.loads(text)
-                    choice = chunk.get("choices", [{}])[0]
+                    if observed_identity is not None:
+                        if not isinstance(chunk, dict):
+                            raise IdentityError("AI_EVALUATION_RESPONSE_INVALID")
+                        if saw_done:
+                            raise observed_identity.error("AI_EVALUATION_RESPONSE_INCOMPLETE")
+                        observed_identity.feed(chunk)
+                        choices = chunk.get("choices", [])
+                        if not isinstance(choices, list) or len(choices) > 1 or (choices and not isinstance(choices[0], dict)):
+                            raise observed_identity.error("AI_EVALUATION_RESPONSE_INVALID")
+                    choice = ((chunk.get("choices") or [{}])[0] if observed_identity is not None
+                              else chunk.get("choices", [{}])[0])
                     delta = choice.get("delta", {})
+                    if observed_identity is not None:
+                        if not isinstance(delta, dict) or (delta.get("content") is not None and not isinstance(delta["content"], str)) or delta.get("tool_calls"):
+                            raise observed_identity.error("AI_EVALUATION_RESPONSE_INVALID")
+                        if terminal_reason is not None and delta.get("content"):
+                            raise observed_identity.error("AI_EVALUATION_RESPONSE_INCOMPLETE")
 
                     collected_content += delta.get("content") or ""
 
@@ -2103,11 +2200,17 @@ async def _non_stream_response(
                     fr = choice.get("finish_reason")
                     if fr:
                         finish_reason = fr
+                        if observed_identity is not None:
+                            if not isinstance(fr, str) or fr not in {"stop", "length", "content_filter"} or (terminal_reason is not None and terminal_reason != fr):
+                                raise observed_identity.error("AI_EVALUATION_RESPONSE_INCOMPLETE")
+                            terminal_reason = fr
 
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     resp_model = chunk.get("model", resp_model)
                 except (json.JSONDecodeError, IndexError, KeyError):
+                    if observed_identity is not None:
+                        raise IdentityError("AI_EVALUATION_RESPONSE_INVALID")
                     pass
 
         finally:
@@ -2120,6 +2223,16 @@ async def _non_stream_response(
             log.warning(f"[{model}] Empty response, retrying...")
             await asyncio.sleep(1)
             continue
+
+        proof = None
+        if observed_identity is not None:
+            resp_model = observed_identity.verify()
+            if terminal_reason is None:
+                raise observed_identity.error("AI_EVALUATION_RESPONSE_INCOMPLETE")
+            if not collected_content:
+                raise observed_identity.error("AI_EMPTY_RESPONSE")
+            proof = {**evaluation_binding, "observed": True, "observedModel": resp_model, "upstreamAttempts": 1,
+                     "responseComplete": True, "finishReason": terminal_reason, "sawDone": saw_done}
 
         elapsed = time.monotonic() - t_start
         prompt_t = usage.get("prompt_tokens", "?")
@@ -2142,6 +2255,7 @@ async def _non_stream_response(
                 "finish_reason": finish_reason,
             }],
             "usage": usage,
+            **({"nglEvaluationIdentity": proof} if proof is not None else {}),
         })
 
     raise HTTPException(status_code=502, detail="Upstream returned empty response")
